@@ -12,9 +12,11 @@ import shutil
 import zipfile
 import io
 import logging
+from flask_cors import CORS
 
 logging.basicConfig(level=logging.INFO)
 app = Flask(__name__)
+CORS(app)
 
 # Initialize Instaloader with custom settings
 L = instaloader.Instaloader(
@@ -181,4 +183,4 @@ def process_instagram():
             return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5001)
+    app.run(debug=True, host='0.0.0.0', port=5001)
