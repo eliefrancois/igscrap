@@ -13,10 +13,33 @@ import zipfile
 import io
 import logging
 from flask_cors import CORS
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 
-logging.basicConfig(level=logging.INFO)
+# Enhanced logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('instagram_scraper.log')
+    ]
+)
+
 app = Flask(__name__)
 CORS(app)
+
+# Add basic rate limiting
+limiter = Limiter(
+    app=app,
+    key_func=get_remote_address,
+    default_limits=["100 per day", "10 per hour"]
+)
+
+# Add a health check endpoint
+@app.route('/health', methods=['GET'])
+def health_check():
+    return jsonify({'status': 'healthy'}), 200
 
 # Initialize Instaloader with custom settings
 L = instaloader.Instaloader(
@@ -133,9 +156,12 @@ def process_video(file_path):
         # return processed_video
 
 @app.route('/process_instagram', methods=['POST'])
+@limiter.limit("10 per hour")  # Specific rate limit for this endpoint
 def process_instagram():
+    logging.info(f"Received request from: {request.remote_addr}")
     profile_url = request.json.get('profile_url')
     if not profile_url:
+        logging.error("No profile URL provided")
         return jsonify({'error': 'No profile URL provided'}), 400
 
     profile_name = profile_url.split('/')[-2]  # Extract profile name from URL
@@ -183,4 +209,8 @@ def process_instagram():
             return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5001)
+    # Get port from environment variable or default to 5001
+    port = int(os.environ.get('PORT', 5001))
+    
+    logging.info(f"Starting Flask server on port {port}")
+    app.run(debug=True, host='0.0.0.0', port=port)
