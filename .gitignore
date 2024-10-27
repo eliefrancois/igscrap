@@ -43,3 +43,11 @@ env/
 .venv/
 ENV/
 myenv/
+
+
+instagram_scraper.log
+*_scraper.log
+
+
+ngrok.log
+apiTest.http

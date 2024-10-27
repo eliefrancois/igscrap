@@ -15,6 +15,7 @@ import logging
 from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
+from celery_config import make_celery
 
 # Enhanced logging
 logging.basicConfig(
@@ -28,6 +29,7 @@ logging.basicConfig(
 
 app = Flask(__name__)
 CORS(app)
+celery = make_celery(app)
 
 # Add basic rate limiting
 limiter = Limiter(
@@ -35,6 +37,75 @@ limiter = Limiter(
     key_func=get_remote_address,
     default_limits=["100 per day", "10 per hour"]
 )
+webhook_url = "https://discord.com/api/webhooks/1299118207864537141/SZ3aoV2FzUmTkI-tBsQ5YKGHKjlfPorr11LPNc4pa-t2oqAwonY0vtOitTWrrU8603z-"
+
+def send_discord_notification(webhook_url, profile_url, num_videos):
+    message = f"Videos have been processed successfully!\nProfile URL: {profile_url}\nNumber of videos: {num_videos}"
+    data = {
+        "content": message
+    }
+    response = requests.post(webhook_url, json=data)
+    
+    if response.status_code == 204:
+        logging.info("Notification sent successfully.")
+    else:
+        logging.error(f"Failed to send notification. Status code: {response.status_code}, Response: {response.text}")
+
+# Define the task
+@celery.task(bind=True)
+def process_instagram_task(self, profile_url):
+    try:
+        # Initial state
+        self.update_state(state='DOWNLOADING', meta={'progress': 0})
+        profile_name = profile_url.split('/')[-2]
+        
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # Download posts
+            self.update_state(state='DOWNLOADING', meta={'progress': 25})
+            download_dir = download_posts(profile_name, temp_dir)
+            processed_files = []
+
+            # Process files
+            self.update_state(state='PROCESSING', meta={'progress': 50})
+            for root, dirs, files in os.walk(download_dir):
+                for filename in files:
+                    file_path = os.path.join(root, filename)
+                    logging.info(f"Processing file: {file_path}")
+                    if filename.endswith('.mp4'):
+                        process_video(file_path, bypass_editing=True)
+                        processed_files.append(file_path)
+
+            if not processed_files:
+                return {'status': 'error', 'message': 'No files were processed'}
+
+            # Finalizing
+            self.update_state(state='FINALIZING', meta={'progress': 75})
+
+            # Send Discord notification
+            num_videos = len([f for f in processed_files if f.endswith('.mp4')])
+            send_discord_notification(webhook_url, profile_url, num_videos)
+
+            # Create ZIP file
+            memory_file = io.BytesIO()
+            with zipfile.ZipFile(memory_file, 'w') as zf:
+                for file_path in processed_files:
+                    zf.write(file_path, os.path.relpath(file_path, download_dir))
+            
+            # Finalizing
+            self.update_state(state='FINALIZING', meta={'progress': 100})
+            temp_zip_path = os.path.join(temp_dir, f'{profile_name}_processed.zip')
+            with open(temp_zip_path, 'wb') as f:
+                f.write(memory_file.getvalue())
+
+            return {
+                'status': 'success',
+                'zip_path': temp_zip_path,
+                'profile_name': profile_name
+            }
+
+    except Exception as e:
+        logging.error(f"Error processing Instagram profile: {str(e)}")
+        return {'status': 'error', 'message': str(e)}
 
 # Add a health check endpoint
 @app.route('/health', methods=['GET'])
@@ -77,21 +148,6 @@ def download_posts(profile_name, temp_dir):
     logging.info(f"Posts downloaded to: {target_dir}")
     return target_dir
 
-# Function to send file to Zapier webhook
-"""
-def send_to_zapier(file_path, file_name):
-    zapier_webhook_url = "https://hooks.zapier.com/hooks/catch/20456912/21er2s3/"
-    
-    with open(file_path, 'rb') as file:
-        files = {'file': (file_name, file)}
-        response = requests.post(zapier_webhook_url, files=files)
-    
-    if response.status_code == 200:
-        print(f"Successfully sent {file_name} to Zapier")
-    else:
-        print(f"Failed to send {file_name} to Zapier. Status code: {response.status_code}")
-"""
-
 # Function to edit images to 9:16 aspect ratio with a white background (if not already)
 def edit_image(file_path):
     with Image.open(file_path) as img:
@@ -118,9 +174,14 @@ def edit_image(file_path):
         new_img.save(file_path)
 
 # Function to process videos to 9:16 aspect ratio with a white background (if not already)
-def process_video(file_path):
+def process_video(file_path, bypass_editing=False):
     with VideoFileClip(file_path) as video:
         logging.info(f"Processing video: {file_path}")
+        
+        if bypass_editing:
+            logging.info(f"Bypassing video editing for: {file_path}")
+            return  # Skip processing and return immediately
+
         # Calculate current aspect ratio
         current_ratio = video.w / video.h
         
@@ -145,68 +206,48 @@ def process_video(file_path):
             video = video.crop(x_center=video.w / 2, y_center=video.h / 2, width=new_width, height=new_height)
 
         # Create a new video clip with a white background
-        background = ColorClip(size=(target_width, target_height), color=(255, 255, 255), duration=video.duration)  # Create a blank white video
+        background = ColorClip(size=(target_width, target_height), color=(255, 255, 255), duration=video.duration)
        
         # Overlay the cropped video on the white background
         final_video = CompositeVideoClip([background, video.set_position("center")])
 
         # Write the final video to the same file path, overwriting the original
-        processed_video = final_video.write_videofile(file_path, codec='libx264', audio_codec='aac', remove_temp=True)  # Save the processed video
+        processed_video = final_video.write_videofile(file_path, codec='libx264', audio_codec='aac', remove_temp=True)
         logging.info(f"Processed video saved to: {file_path}")
-        # return processed_video
 
 @app.route('/process_instagram', methods=['POST'])
 @limiter.limit("10 per hour")  # Specific rate limit for this endpoint
 def process_instagram():
-    logging.info(f"Received request from: {request.remote_addr}")
     profile_url = request.json.get('profile_url')
     if not profile_url:
-        logging.error("No profile URL provided")
         return jsonify({'error': 'No profile URL provided'}), 400
 
-    profile_name = profile_url.split('/')[-2]  # Extract profile name from URL
+    # Start the Celery task
+    task = process_instagram_task.delay(profile_url)
     
-    with tempfile.TemporaryDirectory() as temp_dir:
-        try:
-            download_dir = download_posts(profile_name, temp_dir)
-            processed_files = []
+    # Return the task ID to the client
+    return jsonify({
+        'task_id': task.id,
+        'status': 'Processing started'
+    })
 
-            # Walk through the directory and its subdirectories
-            for root, dirs, files in os.walk(download_dir):
-                for filename in files:
-                    file_path = os.path.join(root, filename)
-                    logging.info(f"Processing file: {file_path}")
-                    if filename.endswith(('.jpg', '.jpeg')):
-                        edit_image(file_path)
-                        processed_files.append(file_path)
-                    elif filename.endswith('.mp4'):
-                        process_video(file_path)
-                        processed_files.append(file_path)
-
-            if not processed_files:
-                logging.warning("No files were processed")
-                return jsonify({'error': 'No files were processed'}), 404
-
-            # Create a ZIP file containing all processed files
-            memory_file = io.BytesIO()
-            with zipfile.ZipFile(memory_file, 'w') as zf:
-                for file_path in processed_files:
-                    zf.write(file_path, os.path.relpath(file_path, download_dir))
-            memory_file.seek(0)
-
-            logging.info(f"Processed {len(processed_files)} files")
+# Add a route to check task status
+@app.route('/task_status/<task_id>', methods=['GET'])
+def task_status(task_id):
+    task = process_instagram_task.AsyncResult(task_id)
+    if task.ready():
+        result = task.get()
+        if result['status'] == 'success':
+            # Return the processed ZIP file
             return send_file(
-                memory_file,
+                result['zip_path'],
                 mimetype='application/zip',
                 as_attachment=True,
-                download_name=f'{profile_name}_processed.zip'
+                download_name=f"{result['profile_name']}_processed.zip"
             )
-        except instaloader.exceptions.ProfileNotExistsException:
-            logging.error(f"Profile {profile_name} does not exist")
-            return jsonify({'error': f"Profile {profile_name} does not exist"}), 404
-        except Exception as e:
-            logging.error(f"Error processing Instagram profile: {str(e)}")
-            return jsonify({'error': str(e)}), 500
+        else:
+            return jsonify({'status': 'error', 'message': result['message']}), 400
+    return jsonify({'status': 'processing'})
 
 if __name__ == '__main__':
     # Get port from environment variable or default to 5001
