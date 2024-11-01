@@ -7,7 +7,11 @@ def make_celery(app):
         backend='redis://localhost:6379/0',
         broker='redis://localhost:6379/0'
     )
-    celery.conf.update(app.config)
+    celery.conf.update(
+        broker_connection_retry_on_startup=True,
+        worker_pool_restarts=True,
+        worker_pool='solo'
+    )
 
     class ContextTask(celery.Task):
         def __call__(self, *args, **kwargs):
